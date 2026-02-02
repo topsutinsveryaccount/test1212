@@ -1,614 +1,2116 @@
-//Joseph Hewitt 2023
-//This code is for the ESP32 "Side B" of the wardriver hardware revision 3.
+// Joseph Hewitt 2023
+// BW16 "Side A" port - Dual-band Wi-Fi, no GSM, no Side-B for now.
 
-//Serial = PC, 115200
-//Serial1 = ESP32 (side A), 115200
-//Serial2 = SIM800L module, 9600
+#include <Arduino.h>
 
+const String VERSION = "1.3.0b1";
+const String BUILD = "[CI_BUILD_HERE]";
+
+// ===== Platform feature guards =====
+#if __has_include("mbedtls/sha256.h")
+  #include "mbedtls/sha256.h"
+  #define HAVE_MBEDTLS 1
+#else
+  #define HAVE_MBEDTLS 0
+#endif
+
+#if __has_include("Update.h")
+  #include <Update.h>
+  #define HAVE_UPDATE 1
+#else
+  #define HAVE_UPDATE 0
+#endif
+
+#include <GParser.h>
+#include <MicroNMEA.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 #include <WiFi.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
-#include <Update.h>
-#include "mbedtls/sha256.h"
-#include "mbedtls/md.h"
+#include <WiFiClientSecure.h>
+#include <time.h>
 
-//LCD stuff. Side B does not normally have an LCD but this allows us to print an error if you flash the firmware onto the wrong ESP32.
+// ===== Logging shim (ESP32-style) =====
+static const char* LOG_TAG_GENERIC = "wdGeneric";
+static void log_printf(const char* level, const char* tag, const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print("[");
+  Serial.print(level);
+  Serial.print("][");
+  Serial.print(tag);
+  Serial.print("] ");
+  Serial.println(buf);
+}
+#define ESP_LOGI(tag, fmt, ...) log_printf("I", tag, fmt, ##__VA_ARGS__)
+#define ESP_LOGW(tag, fmt, ...) log_printf("W", tag, fmt, ##__VA_ARGS__)
+#define ESP_LOGE(tag, fmt, ...) log_printf("E", tag, fmt, ##__VA_ARGS__)
+#define ESP_LOGD(tag, fmt, ...) log_printf("D", tag, fmt, ##__VA_ARGS__)
+#define ESP_LOGV(tag, fmt, ...) log_printf("V", tag, fmt, ##__VA_ARGS__)
+
+// ===== OLED =====
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 32 // OLED display height, in pixels
-#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-#include <OneWire.h>
-OneWire  ds(22); //DS18B20 data pin is 22.
-byte addr[8]; //The DS18B20 address
+// ===== SD =====
+#define SD_CS 5
+#define SPI_FREQ 10000000
 
-boolean serial_lock = false; //Set to true when the serial with side A is in active use.
-boolean temperature_sensor_ok = true; //Set to false automatically if a DS18B20 is not detected.
-boolean ota_mode = false; //Set to true automatically when doing OTA update
-String ota_hash = ""; //SHA256 of the OTA update, set automatically.
+// ===== GPS =====
+char nmeaBuffer[100];
+MicroNMEA nmea(nmeaBuffer, sizeof(nmeaBuffer));
+unsigned long lastgps = 0;
+String last_lats = "";
+String last_lons = "";
 
-boolean using_bw16 = false; //Set when advanced config is sb_bw16=yes https://wardriver.uk/advanced_config
+// ===== Time =====
+#define YEAR_2020 1577836800
+const char* ntpServer = "pool.ntp.org";
 
-#define mac_history_len 256
+// ===== Globals =====
+File filewriter;
+unsigned long bootcount = 0;
+unsigned long booted_at = 0;
+unsigned long started_at_millis = 0;
 
-struct mac_addr {
-   unsigned char bytes[6];
+float temperature = 0.0f;
+unsigned int wifi_count = 0;
+unsigned int disp_wifi_count = 0;
+unsigned int count_5ghz = 0;
+unsigned long total_new_wifi = 0;
+
+boolean use_blocklist = false;
+unsigned long wifi_block_at = 0;
+
+String default_ssid = "wardriver.uk";
+const char* default_psk = "wardriver.uk";
+
+boolean rotate_display = false;
+boolean block_resets = false;
+boolean block_reconfigure = false;
+int web_timeout = 60000;
+int gps_allow_stale_time = 60000;
+boolean enforce_valid_binary_checksums = true;
+boolean nets_over_uart = false;
+String ota_hostname = "ota.wardriver.uk";
+unsigned long auto_reset_ms = 0;
+float force_lat = 0;
+float force_lon = 0;
+boolean scanble = false; // No Side-B yet
+boolean tempunits_c = true;
+boolean con_ssid_update = false;
+
+boolean ota_optout = false;
+boolean wigle_commercial = false;
+boolean wigle_autoupload = false;
+String wigle_api_key = "";
+String wigle_username = "";
+
+// ===== Device identity =====
+#define DEVICE_UNKNOWN   254
+#define DEVICE_CUSTOM    0
+#define DEVICE_REV3      1
+#define DEVICE_REV3_5    2
+#define DEVICE_REV4      3
+#define DEVICE_REV3_5GM  4
+#define DEVICE_CSF_MINI  5
+byte DEVICE_TYPE = DEVICE_CUSTOM;
+
+uint32_t chip_id = 0;
+
+// ===== Blocklist =====
+#define mac_history_len 512
+#define blocklist_len 20
+#define blocklist_str_len 32
+#define wigle_history_len 256
+
+struct mac_addr { unsigned char bytes[6]; };
+struct block_str { char characters[blocklist_str_len]; };
+
+struct wigle_file {
+  unsigned long fid;
+  unsigned long fsize;
+  unsigned long discovered_gps;
+  unsigned long total_gps;
+  boolean wait;
 };
 
 struct mac_addr mac_history[mac_history_len];
 unsigned int mac_history_cursor = 0;
+struct block_str block_list[blocklist_len];
+struct wigle_file wigle_history[wigle_history_len];
+unsigned int wigle_history_cursor = 0;
 
-int wifi_scan_channel = 1; //The channel to scan (increments automatically)
+unsigned long lcd_last_updated = 0;
 
-void setup_wifi(){
+// ===== Preferences shim (SD-backed) =====
+static bool sd_ready = false;
+
+class SimplePrefs {
+ public:
+  bool begin(const char* ns, bool readOnly=false) {
+    (void)ns;
+    _readOnly = readOnly;
+    if (sd_ready) {
+      load();
+    }
+    return true;
+  }
+  void end() {
+    if (!_readOnly && _dirty && sd_ready) {
+      save();
+    }
+  }
+
+  bool getBool(const char* key, bool def=false) {
+    String v = get(key);
+    if (v == "true" || v == "1" || v == "yes") return true;
+    if (v == "false" || v == "0" || v == "no") return false;
+    return def;
+  }
+  void putBool(const char* key, bool val) {
+    set(key, val ? "true" : "false");
+  }
+
+  unsigned long getULong(const char* key, unsigned long def=0) {
+    String v = get(key);
+    if (v.length() == 0) return def;
+    return (unsigned long)v.toInt();
+  }
+  void putULong(const char* key, unsigned long val) {
+    set(key, String(val));
+  }
+
+  long getLong(const char* key, long def=0) {
+    String v = get(key);
+    if (v.length() == 0) return def;
+    return (long)v.toInt();
+  }
+  void putLong(const char* key, long val) {
+    set(key, String(val));
+  }
+
+  short getShort(const char* key, short def=0) {
+    String v = get(key);
+    if (v.length() == 0) return def;
+    return (short)v.toInt();
+  }
+  void putShort(const char* key, short val) {
+    set(key, String(val));
+  }
+
+  String getString(const char* key, const char* def="") {
+    String v = get(key);
+    if (v.length() == 0) return String(def);
+    return v;
+  }
+  String getString(const char* key, String def="") {
+    String v = get(key);
+    if (v.length() == 0) return def;
+    return v;
+  }
+  void putString(const char* key, String val) {
+    set(key, val);
+  }
+
+  void clear() {
+    _count = 0;
+    _dirty = true;
+  }
+
+  void reload() {
+    if (sd_ready) {
+      load();
+    }
+  }
+
+ private:
+  struct kv { char key[24]; char value[80]; };
+  kv _items[64];
+  int _count = 0;
+  bool _dirty = false;
+  bool _readOnly = false;
+  const char* _file = "/prefs.txt";
+
+  String get(const char* key) {
+    for (int i = 0; i < _count; i++) {
+      if (strcmp(_items[i].key, key) == 0) {
+        return String(_items[i].value);
+      }
+    }
+    return "";
+  }
+
+  void set(const char* key, const String& val) {
+    if (_readOnly) return;
+    for (int i = 0; i < _count; i++) {
+      if (strcmp(_items[i].key, key) == 0) {
+        val.toCharArray(_items[i].value, sizeof(_items[i].value));
+        _dirty = true;
+        return;
+      }
+    }
+    if (_count < (int)(sizeof(_items)/sizeof(_items[0]))) {
+      strncpy(_items[_count].key, key, sizeof(_items[_count].key));
+      val.toCharArray(_items[_count].value, sizeof(_items[_count].value));
+      _count++;
+      _dirty = true;
+    }
+  }
+
+  void load() {
+    _count = 0;
+    if (!SD.exists(_file)) return;
+    File f = SD.open(_file, FILE_READ);
+    if (!f) return;
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (line.length() < 3) continue;
+      int eq = line.indexOf('=');
+      if (eq < 1) continue;
+      String k = line.substring(0, eq);
+      String v = line.substring(eq + 1);
+      if (_count < (int)(sizeof(_items)/sizeof(_items[0]))) {
+        k.toCharArray(_items[_count].key, sizeof(_items[_count].key));
+        v.toCharArray(_items[_count].value, sizeof(_items[_count].value));
+        _count++;
+      }
+    }
+    f.close();
+    _dirty = false;
+  }
+
+  void save() {
+    SD.remove(_file);
+    File f = SD.open(_file, FILE_WRITE);
+    if (!f) return;
+    for (int i = 0; i < _count; i++) {
+      f.print(_items[i].key);
+      f.print("=");
+      f.println(_items[i].value);
+    }
+    f.close();
+    _dirty = false;
+  }
+};
+
+SimplePrefs preferences;
+
+// ===== Certificates =====
+static const char *PRIMARY_OTA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDeTCCAmGgAwIBAgIUbrbwBJuNsr7DeScXZxaUynePHfowDQYJKoZIhvcNAQEL
+BQAwTDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpIMRUwEwYDVQQKDAx3YXJkcml2
+ZXIudWsxGTAXBgNVBAMMEG90YS53YXJkcml2ZXIudWswHhcNMjMwNjA4MjAwMTQ1
+WhcNMjUwMTI4MjAwMTQ1WjBMMQswCQYDVQQGEwJOTDELMAkGA1UECAwCWkgxFTAT
+BgNVBAoMDHdhcmRyaXZlci51azEZMBcGA1UEAwwQb3RhLndhcmRyaXZlci51azCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANhPWzq8txiMt4IJikuZnNov
+6rAvAM3OicSKofdkOuvNOV6HlVmfzYVNNlESakuloEYRPwF7oxhQEPeU2X2jsQK6
+cCuWrAR2SWPTJ1kk+gNMx7Xq7GOU11wuHFJNRESdOCSCvixCjg/fbMb0Zmt9z/gX
+Rur0Pg/uYEcUgFyJ8KYgDh7m7chCfcFafhQ5RnkXpMINBZX+GmC/BQ57uZhrdTyY
+x5ZnjrLjzvjgLmABRTynCELPDjosfquxW+fHoG48qk4QLMhu/f8JItOce5kmIvS+
+v/766LN2gVK7oYlWjN44Sa/5hlp6Rl2YXGayYOAiivuyr/vniG0xoi2LBe1/WtsC
+AwEAAaNTMFEwHQYDVR0OBBYEFF5wxZNmrWN8/a2a0fAPmJJ/m+OaMB8GA1UdIwQY
+MBaAFF5wxZNmrWN8/a2a0fAPmJJ/m+OaMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBACpF2qkQd40MLWkMDYaoZFYeZMMt7ktsRAjo6P5HNVAQMdMz
+i9GtYLiXNFyw/Ub0X0JFwZDiqFSKcxJIWx5hgEVTSIvg36ZCRmrP1gmcVtzLbgjG
+oTlYBrUQdeH0KYG+7xMdPJI4+8yc3OXsoZjr4tIlbZJtej6OBipZks645BKUAs3a
+NUVm7tvzg9hEsfPDXXubcK6JLPdNwrnVEmwq6NlKVVHN9McExBumGKnyKYGK8MZF
+KwkScjhM4MVp5+qVrnuZgqkwM0ZOpZ/vAlD6Csv/DplY92nZs1vHSp2RDVHq6IFI
+IY8r4D96F4ocMmptiPuXifjDkGbXPqfnJhwhaMA=
+-----END CERTIFICATE-----
+)EOF";
+
+static const char *FALLBACK_OTA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDgTCCAmmgAwIBAgIUPCSsdEWm6C+RS/JoFaREpBmwqMMwDQYJKoZIhvcNAQEL
+BQAwUDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpIMRkwFwYDVQQKDBBvdGEud2Fy
+ZHJpdmVyLnVrMRkwFwYDVQQDDBBvdGEud2FyZHJpdmVyLnVrMB4XDTI0MTAwNTEx
+MDA1MloXDTI1MTAwNTExMDA1MlowUDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpI
+MRkwFwYDVQQKDBBvdGEud2FyZHJpdmVyLnVrMRkwFwYDVQQDDBBvdGEud2FyZHJp
+dmVyLnVrMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsyLzjymRag1m
+esKhQMPEJSM05YvSZYQfh7gIYDmjTbETRkQ530HR2CA9eMF45BjmzZ7Tn3W5rxBE
+kh3uH1YwELgPV0nNCIvoJEAF1vseYqkRH4zFxlqf6hXKrBn8NJ1gmDuDovul86AO
+ahi505xt/2iXXDXjTks0f/HkVkSRiKIOP6V7XluuNBN5nDpESCZ0bglL2dy7qy9O
+LTzN9raX7qLzThjnx69Flc4TFtixk/02taedw8ZH7bedBts3duS/ODMzAipaXIqj
+paEBfFnjfan2A9nLJwHPS7g0Ec4KR3syifLU1ff+N79rHtGCZjnVG9Bn70vYXwA5
+PfxTs+9ctQIDAQABo1MwUTAdBgNVHQ4EFgQU0iKKwPG/hNN5l5K5t7jVsDUmbegw
+HwYDVR0jBBgwFoAU0iKKwPG/hNN5l5K5t7jVsDUmbegwDwYDVR0TAQH/BAUwAwEB
+/zANBgkqhkiG9w0BAQsFAAOCAQEAUky/qKRmIdK0N9n9aSDZLjm3KBHUsr+9BV85
+i9B8LRhfPEq42tTYBdppNatShz5DKwQSW3tzoVJZkWWd/Lz8/K78eTQ1x//rc4cL
+SzjKNiSvx61xJ+WFdczTUmmnAoI4LW83gAUCUOGzZ5PCCiG8h2XRz/C3snN89IN+
+PghVRXsXxN9cE0ZpzGZcnKY0l6x2qNdX92j6RBjrmQ7kKRDaVGswcezCaxy3kgUC
+4Q8nhWv5EzWfwtlY7QZ6WmKwpqWe1PpR7JQz/2wbQDLvJNhDrK+fFk/+8//6ZkgT
+wZj2V+gRCHJi8TgvXDv6rnR/BXSM0Gh/uEXo1Ev5q4YmgUZCVw==
+-----END CERTIFICATE-----
+)EOF";
+
+// ===== Helpers =====
+void clear_display() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+}
+
+void setup_wifi() {
+  WiFi.mode(WIFI_OFF);
+  delay(250);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 }
 
-BLEScan* pBLEScan;
-
-void await_serial(){
-  while(serial_lock){
-    Serial.println("await");
-    delay(1);
+String hex_str(const unsigned char buf[], size_t len) {
+  String outstr;
+  char outchr[6];
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] <= 0xF) {
+      sprintf(outchr, "0%x", buf[i]);
+    } else {
+      sprintf(outchr, "%x", buf[i]);
+    }
+    outstr = outstr + outchr;
   }
+  return outstr;
 }
 
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
-      unsigned char mac_bytes[6];
-      int values[6];
-  
-      if (6 == sscanf(advertisedDevice.getAddress().toString().c_str(), "%x:%x:%x:%x:%x:%x%*c", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5])){
-        for(int i = 0; i < 6; ++i ){
-            mac_bytes[i] = (unsigned char) values[i];
-        }
-      
-        if (!seen_mac(mac_bytes)){
-          save_mac(mac_bytes);
-          
-          await_serial();
-          serial_lock = true;
-          Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
-          Serial1.print("BL,");
-          Serial1.print(advertisedDevice.getRSSI());
-          Serial1.print(",");
-          Serial1.print(advertisedDevice.getAddress().toString().c_str());
-          Serial1.print(",");
-          Serial1.println(advertisedDevice.getName().c_str());
-          serial_lock = false;
-        }
+// ===== Minimal SHA256 if mbedtls is missing =====
+#if !HAVE_MBEDTLS
+// Tiny SHA256 implementation (public domain) – reduced for file hashing use.
+class TinySHA256 {
+ public:
+  void init() {
+    datalen = 0;
+    bitlen = 0;
+    state[0]=0x6a09e667; state[1]=0xbb67ae85; state[2]=0x3c6ef372; state[3]=0xa54ff53a;
+    state[4]=0x510e527f; state[5]=0x9b05688c; state[6]=0x1f83d9ab; state[7]=0x5be0cd19;
+  }
+  void update(const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+      this->data[datalen] = data[i];
+      datalen++;
+      if (datalen == 64) {
+        transform();
+        bitlen += 512;
+        datalen = 0;
       }
     }
+  }
+  void final(uint8_t hash[32]) {
+    size_t i = datalen;
+    if (datalen < 56) {
+      data[i++] = 0x80;
+      while (i < 56) data[i++] = 0x00;
+    } else {
+      data[i++] = 0x80;
+      while (i < 64) data[i++] = 0x00;
+      transform();
+      memset(data, 0, 56);
+    }
+    bitlen += datalen * 8;
+    data[63] = bitlen;
+    data[62] = bitlen >> 8;
+    data[61] = bitlen >> 16;
+    data[60] = bitlen >> 24;
+    data[59] = bitlen >> 32;
+    data[58] = bitlen >> 40;
+    data[57] = bitlen >> 48;
+    data[56] = bitlen >> 56;
+    transform();
+    for (i = 0; i < 4; ++i) {
+      hash[i]      = (state[0] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 8]  = (state[2] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 12] = (state[3] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 16] = (state[4] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 20] = (state[5] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 24] = (state[6] >> (24 - i * 8)) & 0x000000ff;
+      hash[i + 28] = (state[7] >> (24 - i * 8)) & 0x000000ff;
+    }
+  }
+
+ private:
+  uint8_t data[64];
+  uint32_t datalen;
+  uint64_t bitlen;
+  uint32_t state[8];
+
+  static uint32_t rotr(uint32_t a, uint32_t b) { return (((a) >> (b)) | ((a) << (32-(b)))); }
+  static uint32_t choose(uint32_t e, uint32_t f, uint32_t g) { return (e & f) ^ (~e & g); }
+  static uint32_t majority(uint32_t a, uint32_t b, uint32_t c) { return (a & b) ^ (a & c) ^ (b & c); }
+  static uint32_t sig0(uint32_t x) { return rotr(x,2) ^ rotr(x,13) ^ rotr(x,22); }
+  static uint32_t sig1(uint32_t x) { return rotr(x,6) ^ rotr(x,11) ^ rotr(x,25); }
+  static uint32_t theta0(uint32_t x) { return rotr(x,7) ^ rotr(x,18) ^ (x >> 3); }
+  static uint32_t theta1(uint32_t x) { return rotr(x,17) ^ rotr(x,19) ^ (x >> 10); }
+
+  void transform() {
+    static const uint32_t k[64] = {
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    };
+    uint32_t m[64];
+    for (uint32_t i = 0, j = 0; i < 16; ++i, j += 4) {
+      m[i] = (data[j] << 24) | (data[j+1] << 16) | (data[j+2] << 8) | (data[j+3]);
+    }
+    for (uint32_t i = 16; i < 64; ++i) {
+      m[i] = theta1(m[i-2]) + m[i-7] + theta0(m[i-15]) + m[i-16];
+    }
+
+    uint32_t a=state[0], b=state[1], c=state[2], d=state[3];
+    uint32_t e=state[4], f=state[5], g=state[6], h=state[7];
+
+    for (uint32_t i = 0; i < 64; ++i) {
+      uint32_t t1 = h + sig1(e) + choose(e,f,g) + k[i] + m[i];
+      uint32_t t2 = sig0(a) + majority(a,b,c);
+      h = g; g = f; f = e; e = d + t1;
+      d = c; c = b; b = a; a = t1 + t2;
+    }
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d;
+    state[4]+=e; state[5]+=f; state[6]+=g; state[7]+=h;
+  }
 };
+#endif
 
-TaskHandle_t loop2handle;
+String file_hash(String filename, boolean update_lcd=false, String lcd_prompt="Wardriver busy") {
+  File reader = SD.open(filename, FILE_READ);
+  if (!reader) return "";
 
-void request_temperature(){
-  if (!temperature_sensor_ok){
-    return;
+  unsigned char genhash[32];
+  static byte bbuf[4096];
+
+#if HAVE_MBEDTLS
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+#else
+  TinySHA256 ctx;
+  ctx.init();
+#endif
+
+  int i = 0;
+  while (reader.available()) {
+    int bytes_read = reader.read(bbuf, sizeof(bbuf));
+    if (bytes_read > 0) {
+#if HAVE_MBEDTLS
+      mbedtls_sha256_update(&ctx, bbuf, bytes_read);
+#else
+      ctx.update(bbuf, bytes_read);
+#endif
+    }
+    if (update_lcd) {
+      i++;
+      if (i > 30 || i == 0) {
+        i = 1;
+        clear_display();
+        display.println(lcd_prompt);
+        float percent = ((float)reader.position() / (float)reader.size()) * 100;
+        display.print(percent);
+        display.println("%");
+        display.display();
+      }
+    }
   }
-  Serial.println("Requesting temperature");
-  ds.reset();
-  ds.select(addr);
-  ds.write(0x44, 1);
-  //A delay of 750ms is required now before the temperature is ready.
+
+#if HAVE_MBEDTLS
+  mbedtls_sha256_finish(&ctx, genhash);
+#else
+  ctx.final(genhash);
+#endif
+
+  reader.close();
+  return hex_str(genhash, sizeof genhash);
 }
 
-void read_temperature(){
-  if (!temperature_sensor_ok){
-    return;
-  }
-  byte present = 0;
-  byte data[12];
-  present = ds.reset();
-  ds.select(addr);    
-  ds.write(0xBE);         // Read Scratchpad
-
-  for (int i = 0; i < 9; i++) {           // we need 9 bytes
-    data[i] = ds.read();
-  }
-
-  int16_t raw = (data[1] << 8) | data[0];  
-  byte cfg = (data[4] & 0x60);
-  // at lower res, the low bits are undefined, so let's zero them
-  if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
-  else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
-  else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
-  //// default is 12 bit resolution, 750 ms conversion time
-  
-  float celsius = (float)raw / 16.0;
-  
-  Serial.print("Temperature = ");
-  Serial.println(celsius);
-  await_serial();
-  serial_lock = true;
-  Serial1.print("TEMP,");
-  Serial1.println(celsius);
-  serial_lock = false;
+String html_escape(String ret) {
+  ret.replace("<","&lt;");
+  ret.replace(">","&gt;");
+  ret.replace("&","&amp;");
+  ret.replace("\"","&quot;");
+  ret.replace("'","&#39;");
+  return ret;
 }
 
-String hex_str(const unsigned char buf[], size_t len)
-{
-    String outstr;
-    char outchr[6];
-    for (size_t i = 0; i < len; i++) {
-        if (buf[i] <= 0xF) {
-            sprintf(outchr, "0%x", buf[i]);
-        } else {
-            sprintf(outchr, "%x", buf[i]);
+String dt_string(time_t now=0) {
+  struct tm ts;
+  char buf[80];
+  ts = *localtime(&now);
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
+  return String(buf);
+}
+
+unsigned long get_epoch(boolean await_valid=false) {
+  time_t now;
+  struct tm timeinfo;
+  if (await_valid) {
+    if (!getLocalTime(&timeinfo)) return 0;
+  }
+  time(&now);
+  return now;
+}
+
+// ===== config via cfg.txt =====
+String get_config_option(String key) {
+  #define max_line_len 64
+  char linebuf[max_line_len];
+  File filereader = SD.open("/cfg.txt", FILE_READ);
+  if (!filereader) return "";
+
+  filereader.setTimeout(500);
+
+  while (filereader.available()){
+    int buflen = filereader.readBytesUntil('\n', linebuf, max_line_len-1);
+    if (buflen < 1) continue;
+
+    String cfgkey = "";
+    String value = "";
+    bool reading_key = true;
+
+    for (int i = 0; i < buflen; i++){
+      if (linebuf[i] == '='){ reading_key = false; continue; }
+      if (linebuf[i] == '\n' || linebuf[i] == '\r'){ break; }
+      if (reading_key) cfgkey.concat(linebuf[i]);
+      else value.concat(linebuf[i]);
+    }
+    if (cfgkey == key){
+      filereader.close();
+      return value;
+    }
+  }
+
+  filereader.close();
+  return "";
+}
+
+int get_config_int(String key, int def=0) {
+  String res = get_config_option(key);
+  if (res == "") return def;
+  return res.toInt();
+}
+
+float get_config_float(String key, int def=0) {
+  String res = get_config_option(key);
+  if (res == "") return def;
+  return res.toFloat();
+}
+
+boolean get_config_bool(String key, boolean def=false) {
+  String res = get_config_option(key);
+  if (res == "true" || res == "yes") return true;
+  if (res == "false" || res == "no") return false;
+  return def;
+}
+
+String get_config_string(String key, String def="") {
+  String res = get_config_option(key);
+  if (res == "") return def;
+  return res;
+}
+
+// ===== WiGLE helpers =====
+struct wigle_file get_wigle_file(int fid, unsigned long fsize){
+  for (unsigned int cur = 0; cur < wigle_history_len; cur++){
+    if (wigle_history[cur].fid == 0) break;
+    if (wigle_history[cur].fid == fid && wigle_history[cur].fsize){
+      return wigle_history[cur];
+    }
+  }
+  struct wigle_file empty = (wigle_file){.fid=0,.fsize=0,.discovered_gps=0,.total_gps=0,.wait=true};
+  return empty;
+}
+
+String generate_filename(String filepath){
+  String fname = "";
+  fname.concat(get_latest_datetime(filepath, true));
+  fname.concat("_");
+  fname.concat(chip_id);
+  fname.concat("_");
+  fname.concat(filepath);
+  fname.replace("/","_");
+  return fname;
+}
+
+String generate_user_agent(){
+  String ret = "wardriver.uk - ";
+  ret.concat(device_type_string());
+  ret.concat(" / ");
+  ret.concat(VERSION);
+  if (!BUILD.startsWith("[")){
+    ret.concat(" - ");
+    ret.concat(BUILD);
+  }
+  return ret;
+}
+
+void wigle_load_history(){
+  wigle_history_cursor = 0;
+  if (!SD.exists("/wigle.crt")) return;
+  if (wigle_api_key.length() < 3) return;
+
+  #define ca_len 3880
+  byte ca_root[ca_len];
+  File careader = SD.open("/wigle.crt", FILE_READ);
+  if (careader.size() > ca_len-2){
+    careader.close();
+    return;
+  }
+  careader.read(ca_root, ca_len);
+  careader.close();
+
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert((char*)ca_root);
+  if (!httpsclient.connect("api.wigle.net", 443)) return;
+
+  httpsclient.println("GET /api/v2/file/transactions?pagestart=0&pageend=300 HTTP/1.0");
+  httpsclient.println("Host: api.wigle.net");
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  httpsclient.print("Authorization: Basic ");
+  httpsclient.println(wigle_api_key);
+  httpsclient.println();
+
+  boolean headers = true;
+  String lbuf = "";
+  while (httpsclient.connected()){
+    if (headers){
+      lbuf = httpsclient.readStringUntil('\n');
+      if (lbuf.length() < 3) headers = false;
+    } else {
+      int first_pos = 0;
+      int second_pos = 0;
+      lbuf = httpsclient.readStringUntil('}');
+
+      if (lbuf.indexOf("username") > 0){
+        first_pos = lbuf.indexOf("username\":\"")+11;
+        second_pos = lbuf.indexOf("\"", first_pos);
+        String username = lbuf.substring(first_pos, second_pos);
+        if (username.length() > 2 && username.length() < 33){
+          wigle_username = username;
         }
-        outstr = outstr + outchr;
-    }
-    return outstr;
-}
+      }
 
-void setup() {
-  setup_wifi();
-  delay(5000);
-  Serial.begin(115200); //PC, if connected.
-  Serial.println("Starting");
-  
-  Serial1.begin(115200,SERIAL_8N1,27,14); //ESP A, pins 27/14
-  Serial1.println("REV3!");
+      String chip_id_str = String(chip_id);
+      if (lbuf.indexOf(chip_id_str) < 0) continue;
 
-  Serial.println("Waiting for config vars");
-  Serial1.println("SEND_CONF");
-  Serial1.flush();
-  while (millis() < 11000){
-    String buff = Serial1.readStringUntil('\n');
-    Serial.print("IN:");
-    Serial.println(buff);
-    if (!buff.startsWith("PUSH:")){
-      continue;
-    }
-    buff.replace("PUSH:","");
-    //Lets make this a bit nicer in the future.
-    if (buff.indexOf("sb_bw16=yes") > -1){
-      using_bw16 = true;
+      first_pos = lbuf.indexOf("wd3-")+4;
+      second_pos = lbuf.indexOf(".", first_pos);
+      String filename_id = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("discoveredGps\":")+15;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String discovered_gps = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("totalGps\":")+10;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String total_gps = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("fileSize\":")+10;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String file_size = lbuf.substring(first_pos, second_pos);
+
+      boolean is_waiting = true;
+      if (lbuf.indexOf("wait\":null") > 0) is_waiting = false;
+
+      if (wigle_history_cursor < wigle_history_len){
+        struct wigle_file wf = (wigle_file){
+          .fid=(int)filename_id.toInt(),
+          .fsize=(int)file_size.toInt(),
+          .discovered_gps=(int)discovered_gps.toInt(),
+          .total_gps=(int)total_gps.toInt(),
+          .wait=is_waiting
+        };
+        wigle_history[wigle_history_cursor] = wf;
+        wigle_history_cursor++;
+      }
     }
   }
+}
 
-  int sensor_attempts = 0;
-  while ( !ds.search(addr)) {
-    Serial.println("No more addresses.");
-    Serial.println();
-    ds.reset_search();
-    delay(250);
-    sensor_attempts++;
-    if (sensor_attempts > 5){
-      temperature_sensor_ok = false;
+boolean wigle_upload(String path){
+  if (!SD.exists(path)) return false;
+  if (!SD.exists("/wigle.crt")) return false;
+
+  #define ca_len 3880
+  byte ca_root[ca_len];
+  File careader = SD.open("/wigle.crt", FILE_READ);
+  if (careader.size() > ca_len-2){
+    careader.close();
+    return false;
+  }
+  careader.read(ca_root, ca_len);
+  careader.close();
+
+  String boundary = "wduk";
+  boundary.concat(random(0x7FFFFFFF));
+
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert((char*)ca_root);
+  if (!httpsclient.connect("api.wigle.net", 443)) return false;
+
+  File filereader = SD.open(path);
+
+  String nice_filename = generate_filename(path);
+
+  int cd_header_len = 0;
+  cd_header_len += (boundary.length()+2)*3;
+  cd_header_len += 2;
+  cd_header_len += 56;
+  cd_header_len += nice_filename.length();
+  cd_header_len += 22;
+  cd_header_len += 45;
+  if (wigle_commercial){
+    cd_header_len += 4;
+  }
+  cd_header_len += 22;
+
+  httpsclient.println("POST /api/v2/file/upload HTTP/1.0");
+  httpsclient.println("Host: api.wigle.net");
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  if (wigle_api_key.length() > 2){
+    httpsclient.print("Authorization: Basic ");
+    httpsclient.println(wigle_api_key);
+  }
+  httpsclient.print("Content-Type: multipart/form-data; boundary=");
+  httpsclient.println(boundary);
+  httpsclient.print("Content-Length: ");
+  httpsclient.println(filereader.size()+cd_header_len);
+
+  boundary = "--" + boundary;
+  httpsclient.println();
+  httpsclient.println(boundary);
+  httpsclient.print("Content-Disposition: form-data; name=\"file\"; filename=\"");
+  httpsclient.print(nice_filename);
+  httpsclient.println("\"");
+  httpsclient.println("Content-Type: text/csv");
+  httpsclient.println();
+
+  #define CBUFLEN 1024
+  byte cbuf[CBUFLEN];
+
+  while (filereader.available()){
+    int bytes_read = filereader.read(cbuf, CBUFLEN);
+    if (bytes_read > 0){
+      httpsclient.write(cbuf, bytes_read);
+    } else {
       break;
     }
   }
 
-  if (temperature_sensor_ok){
-    Serial.print("DS18B20 detected with ID =");
-    for(int i = 0; i < 8; i++) {
-      Serial.write(' ');
-      Serial.print(addr[i], HEX);
-    }
-  
-    Serial.println();
-    if (OneWire::crc8(addr, 7) != addr[7]) {
-        Serial.println("DS18B20 CRC is not valid!");
-        temperature_sensor_ok = false;
-    }
-  
-    request_temperature();
-  } else {
-    Serial.println("Unable to detect DS18B20 temperature sensor!");
+  httpsclient.println();
+  httpsclient.println();
+  httpsclient.println(boundary);
+  httpsclient.println("Content-Disposition: form-data; name=\"donate\"");
+  httpsclient.println();
+  if (wigle_commercial){
+    httpsclient.println("on");
   }
+  httpsclient.print(boundary);
+  httpsclient.println("--");
+  httpsclient.println();
+  httpsclient.flush();
 
-  int baud_rate = 9600;
-  if (using_bw16){
-    baud_rate = 38400;
-    Serial.println("Using BW16 instead of SIM800L");
-  }
-
-  Serial2.begin(baud_rate); //SIM800L/BW16
-  delay(50);
-  if (!using_bw16){
-    Serial.println("Requesting data from SIM");
-    Serial2.print("AT+CNETSCAN=1\r\n");
-    Serial2.flush();
-    int i = 0;
-    boolean response = false;
-    while (i < 2000){
-      if (Serial2.available()){
-        char c = Serial2.read();
-        Serial.write(c);
-        response = true;
-      } else {
-        delay(1);
-      }
-      i++;
+  String serverres = "";
+  while (httpsclient.connected()){
+    if (httpsclient.available()){
+      char c = httpsclient.read();
+      serverres.concat(c);
     }
-    Serial.println();
-  
-    if (!response){
-      Serial.println("SIM800L did not respond.");
-      delay(3000);
-      Serial2.print("AT+CNETSCAN=1\r\n");
-    }
-  } else {
-    Serial.println("Waking BW16");
-    Serial2.print("AT\r\n");
-    Serial2.flush();
+    if (serverres.length() > 1024) break;
   }
+  httpsclient.stop();
 
-  Serial.println("Setting up Bluetooth scanning");
-  BLEDevice::init("");
-  pBLEScan = BLEDevice::getScan(); //create new scan
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(false); //active scan uses more power, but get results faster
-  pBLEScan->setInterval(50);
-  pBLEScan->setWindow(40);  // less or equal setInterval value
-
-
-  Serial.println("Setting up multithreading");
-  xTaskCreatePinnedToCore(
-      loop2, /* Function to implement the task */
-      "loop2", /* Name of the task */
-      10000,  /* Stack size in words */
-      NULL,  /* Task input parameter */
-      0,  /* Priority of the task */
-      &loop2handle,  /* Task handle. */
-      0); /* Core where the task should run */
-
-  Serial.println("Started");
-  Serial1.println("REV3!");
-  if (!temperature_sensor_ok){
-    //If there's no temperature sensor, attempt to put a warning on the LCD.
-    //This is side B so there should be no LCD. This should only be visible if side A is flashed with this code.
-    //The display.begin() line kills the DS18B20 communication (bug), hence why we check for the sensor.
-    //Side A does not have a DS18B20, so if we detect one then we clearly aren't running on A and the warning isn't needed.
-    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
-        Serial.println(F("SSD1306 allocation failed (this is completely okay)"));
-    }
-    display.setRotation(2);
-    display.clearDisplay();
-    display.setTextSize(1);      // Normal 1:1 pixel scale
-    display.setTextColor(WHITE); // Draw white text
-    display.setCursor(0, 0);     // Start at top-left corner
-    display.cp437(true);         // Use full 256 char 'Code Page 437' font
-    display.println("SIDE B CODE RUNNING ON SIDE A?");
-    display.println("Check documentation @ wardriver.uk");
-    display.display();
-  }
+  if (serverres.indexOf("\"success\":true") > -1) return true;
+  return false;
 }
 
-unsigned long last_sim_request;
-unsigned long last_temperature;
+String ota_get_url(String url, String write_to=""){
+  if (ota_optout) return "";
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert(PRIMARY_OTA_CERT);
 
-void loop() {
-  if (ota_mode){
-    boolean preamble_started = false;
-    boolean binary_started = false;
-    Serial.println("Core1 OTA");
-    Serial1.println(ota_hash);
-    Serial1.flush();
-    Update.begin(UPDATE_SIZE_UNKNOWN);
+  if (!httpsclient.connect(ota_hostname.c_str(), 443)){
+    httpsclient.setCACert(FALLBACK_OTA_CERT);
+    if (!httpsclient.connect(ota_hostname.c_str(), 443)){
+      return "";
+    }
+  }
+  httpsclient.print("GET ");
+  httpsclient.print(url);
+  httpsclient.println(" HTTP/1.0");
+  httpsclient.print("Host: ");
+  httpsclient.println(ota_hostname);
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  httpsclient.println();
+
+  String return_out = "";
+  boolean headers_ended = false;
+  unsigned long content_length_long = 0;
+
+  while (httpsclient.connected()){
+    String buff = httpsclient.readStringUntil('\n');
+    if (buff == "\r" || buff == "\n" || buff.length() == 0){
+      headers_ended = true;
+      if (write_to == "") continue;
+    }
+    if (!headers_ended){
+      int clpos = buff.indexOf("Content-Length: ");
+      if (clpos > -1){
+        String content_length = buff.substring(clpos+16);
+        content_length_long = content_length.toInt();
+      }
+    }
+    if (headers_ended){
+      if (write_to == ""){
+        return_out.concat(buff);
+        return_out.concat('\n');
+        if (return_out.length() > 1024) return return_out;
+      } else {
+        SD.remove(write_to);
+        File fw_writer = SD.open(write_to, FILE_WRITE);
+        unsigned long lastbyte = millis();
+        unsigned long bytecounter = 0;
+        while (httpsclient.connected() && (millis() - lastbyte) < 10000){
+          if (httpsclient.available()){
+            byte c = httpsclient.read();
+            bytecounter++;
+            fw_writer.write(c);
+            lastbyte = millis();
+            if (bytecounter % 6000 == 0){
+              clear_display();
+              display.print("Downloading ");
+              display.println(write_to);
+              display.print(((float)bytecounter / (float)content_length_long) * 100);
+              display.println("%");
+              display.display();
+            }
+          }
+        }
+        fw_writer.flush();
+        fw_writer.close();
+      }
+    }
+  }
+  return return_out;
+}
+
+String online_hash_check(String check_hash){
+  String url = "/hashes/";
+  url.concat(check_hash);
+  url.concat(".txt");
+
+  String result = ota_get_url(url);
+  if (result == "") return "";
+  String checkfor = "OKHASH>";
+  checkfor.concat(check_hash);
+  if (result.indexOf(checkfor) > -1){
+    int version_pos = result.indexOf("VERS>")+5;
+    int date_pos = result.indexOf("DATE>")+5;
+    String retmsg = "Valid official release ";
+    if (version_pos > -1 && date_pos > -1){
+      int version_end_pos = result.indexOf("\n",version_pos);
+      int date_end_pos = result.indexOf("\n",date_pos);
+      String release_version = result.substring(version_pos, version_end_pos);
+      String release_datetime = result.substring(date_pos, date_end_pos);
+      release_version = html_escape(release_version);
+      release_datetime = html_escape(release_datetime);
+      retmsg.concat(release_version);
+      retmsg.concat(" from ");
+      retmsg.concat(release_datetime);
+      retmsg.concat(". ");
+    }
+    return retmsg;
+  }
+  return "";
+}
+
+boolean install_firmware(String filepath, String expect_hash = "") {
+#if !HAVE_UPDATE
+  (void)filepath; (void)expect_hash;
+  return false;
+#else
+  if (!SD.exists(filepath)) return false;
+
+  String actual_hash = file_hash(filepath, true, "Validating firmware");
+  if (expect_hash.length() > 0 && expect_hash != actual_hash) return false;
+
+  if (enforce_valid_binary_checksums) {
+    String check_result = online_hash_check(actual_hash);
+    if (check_result == "") return false;
+  }
+
+  if (filepath == "/A.bin"){
+    clear_display();
+    display.println("Installing update");
+    display.display();
+
+    File binreader = SD.open(filepath, FILE_READ);
     #define binbuflen 4096
     uint8_t binbuf[binbuflen] = { 0x00 };
-    int counter = 0;
 
-    //Setup a hash context, and somewhere to keep the output.
-    unsigned char genhash[32];
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
-    unsigned long fw_last_byte = millis();
-    
-    while (ota_mode){
-      if (Serial1.available()){
-        byte c = Serial1.read();
-        fw_last_byte = millis();
-        if (c == 0xFF){
-          //Do a flush on the first byte of the preamble, just in case. A side does too.
-          if (!preamble_started){
-            Serial1.flush();
-            Serial.println("OTA preamble");
-          }
-          preamble_started = true;
-        }
-        //0xE9 is the magic, but we won't use it. Maybe one day.
-        if (c != 0xFF && preamble_started){
-          if (!binary_started){
-            Serial.println("OTA preamble end");
-            Serial.flush();
-          }
-          binary_started = true;
-        }
-        if (binary_started){
-          
-          binbuf[counter] = c;
-          counter++;
-          fw_last_byte = millis();
-          if (counter == binbuflen){
-            Update.write(binbuf,counter);
-            mbedtls_sha256_update(&ctx, binbuf, counter);
-            counter = 0;
-            memset(binbuf, 'f', binbuflen);
-          }
-        }
-      } else { //Serial1 available
-        Serial1.write(0xFF);
+    Update.begin(binreader.size());
+    int i = 0;
+    while (binreader.available()) {
+      int bytes_read = binreader.read(binbuf, binbuflen);
+      if (bytes_read > 0){
+        Update.write(binbuf, bytes_read);
+        i++;
       }
-      
-      if (millis() - fw_last_byte > 4000){
-        Serial.println("Upload complete");
-        if (counter > 0){
-          Update.write(binbuf,counter);
-          mbedtls_sha256_update(&ctx, binbuf, counter);
-        }
-        mbedtls_sha256_finish(&ctx, genhash);
-        String actual_hash = hex_str(genhash, sizeof genhash);
-        if (actual_hash == ota_hash){
-          Update.end(true);
-          Serial.println("Update OK and verified");
-          Serial.flush();
-          Serial1.println(actual_hash);
-          delay(500);
-          Serial1.println(actual_hash);
-          Serial1.flush();
-          delay(500);
-          ESP.restart();
-        } else {
-          Serial.println("HASH MISMATCH:");
-          Serial.println(actual_hash);
-          Serial.println(ota_hash);
-          Update.abort();
-          Serial1.println("FAILURE");
-          ESP.restart();
-        }
-        
+      if (i == 80){
+        i = 0;
+        clear_display();
+        display.print("Installing: ");
+        float percent = ((float)binreader.position() / (float)binreader.size()) * 100;
+        display.print(percent);
+        display.println("%");
+        display.println("DO NOT POWER OFF");
+        display.display();
       }
     }
+    Update.end(true);
+    binreader.close();
+    clear_display();
+    display.println("Update installed");
+    display.println("Restarting now");
+    display.display();
+    delay(1000);
+    SD.remove("/A.bin");
+    ESP.restart();
+    return true;
   }
-  clear_mac_history();
-  BLEScanResults foundDevices = pBLEScan->start(2.5, false);
-  await_serial();
-  serial_lock = true;
-  Serial1.print("BLC,");
-  Serial1.println(mac_history_cursor);
-  serial_lock = false;
-  Serial.print("Devices found: ");
-  Serial.println(mac_history_cursor);
-  Serial.println("Scan done!");
-  pBLEScan->clearResults();   // delete results fromBLEScan buffer to release memory
-  if (last_temperature == 0 || millis() - last_temperature > 15000){
-    read_temperature();
-    request_temperature();
-    last_temperature = millis();
-  }
-  
-  //This side will only scan the primary non-overlapping channels; most scan time is dedicated to Bluetooth here.
-  for (int y = 0; y < 4; y++){
-    switch(wifi_scan_channel){
-      case 1:
-        wifi_scan_channel = 6;
-        break;
-      case 6:
-        wifi_scan_channel = 11;
-        break;
-      case 11:
-        wifi_scan_channel = 14;
-        break;
-      default:
-        wifi_scan_channel = 1;
-    }
-  
-    //scanNetworks(bool async, bool show_hidden, bool passive, uint32_t max_ms_per_chan, uint8_t channel)
-    int n = WiFi.scanNetworks(false,true,false,110,wifi_scan_channel);
-    Serial.print("Scan of channel ");
-    Serial.print(wifi_scan_channel);
-    Serial.print(" returned ");
-    Serial.println(n);
-    if (n > 0){
-      for (int i = 0; i < n; i++) {
-        String ssid = WiFi.SSID(i);
-        ssid.replace(",","_");
-        //Normally we would use "WIx," as the first value where x is the value of i+1. We're using "WI0," here to make it easier to parse on side A.
-        Serial.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), WiFi.channel(i), WiFi.RSSI(i), WiFi.encryptionType(i), WiFi.BSSIDstr(i).c_str());
-        await_serial();
-        serial_lock = true;
-        Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), WiFi.channel(i), WiFi.RSSI(i), WiFi.encryptionType(i), WiFi.BSSIDstr(i).c_str());
-        serial_lock = false;
-      }
-    }
-  }
+  return true;
+#endif
 }
 
-void loop2( void * parameter) {
-  boolean had_gsm_data = false;
-  int count_5ghz = 0;
-  while (true) {
-    while (Serial1.available()){
-      //ESP A rarely talks to us, but it's usually important
-      String a_buff = Serial1.readStringUntil('\n');
-      if (a_buff.startsWith("FWUP:")){
-        Serial.println("Core2 OTA prep");
-        ota_hash = a_buff.substring(5);
-        ota_mode = true;
-        while (ota_mode){
-          //Keep this core busy
-          yield();
+boolean check_for_updates(boolean stable=true, boolean download_now=false){
+  String res = ota_get_url("/latest.txt");
+  int cur = 0;
+  String partbuf = "";
+  boolean reading_stable = false;
+  int partcount = 0;
+  boolean update_available = false;
+
+  while (cur <= res.length()){
+    char c = res.charAt(cur);
+    if (c == '>' || c == '\n'){
+      if (partbuf == "SR") reading_stable = true;
+      if (partbuf == "PR") reading_stable = false;
+
+      if (stable == reading_stable){
+        if (partcount == 1){
+          if (partbuf != VERSION) update_available = true;
+        }
+        if (update_available && download_now){
+          if (partcount == 5) ota_get_url(partbuf, "/A.bin");
         }
       }
-      
-    }
-    String s2buf = Serial2.readStringUntil('\n');
-    if (s2buf.length() >= 2){
-      
-     if (s2buf.length() > 30){
-       if (!using_bw16){
-         await_serial();
-         serial_lock = true;
-         Serial1.print("GSM,");
-         Serial1.print(s2buf);
-         had_gsm_data = true;
-         Serial1.println();
-         serial_lock = false;
-       } else {
-        //Parse BW16 line here.
-        String ssid = "";
-        int channel = 0;
-        int rssi = 0;
-        int enc_type = 0;
-        String mac = "";
 
-        #define mac_len 18
-
-        mac = s2buf.substring(s2buf.length()-mac_len);
-        mac.toUpperCase();
-
-        int pos = mac_len+1;
-        int previous_pos = pos;
-        int counter = 0;
-        while (pos <= s2buf.length()){
-          pos++;
-          if (s2buf.charAt(s2buf.length()-pos) != ','){
-            continue;
-          }
-
-          counter++;
-          String match = s2buf.substring(s2buf.length()-pos+1, s2buf.length()-previous_pos);
-          
-
-          if (counter == 1){
-            //RSSI
-            rssi = match.toInt();
-          }
-          if (counter == 2){
-            //Security type
-            if (match.indexOf("WPA2 AES") > -1 || match.indexOf("WPA2 TKIP") > -1) {
-              enc_type = WIFI_AUTH_WPA2_PSK;
-            }
-            if (match.indexOf("WPA2") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_WPA2_ENTERPRISE;
-            }
-            if (match.indexOf("WPA") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_WPA_PSK;
-            }
-            if (match.indexOf("WPA3") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_WPA3_PSK;
-            }
-            if (match.indexOf("None") > -1 && enc_type == 0) {
-              enc_type = WIFI_AUTH_OPEN;
-            }
-          }
-          if (counter == 3){
-            //Channel
-            channel = match.toInt();
-            if (channel > 14){
-              count_5ghz++;
-            }
-
-            int comma_pos = s2buf.indexOf(",")+1;
-
-            ssid = s2buf.substring(comma_pos, s2buf.length()-pos);
-          }
-          if (counter >= 4){
-            break;
-          }
-
-          previous_pos = pos;
-          
-        }
-        
-        serial_lock = true;
-        Serial.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
-        Serial1.printf("WI%d,%s,%d,%d,%d,%s\n", 0, ssid.c_str(), channel, rssi, enc_type, mac.c_str());
-        serial_lock = false;
-       }
-      } else {
-        //Short line, normally we discard this
-        if (using_bw16){
-          if (s2buf.indexOf("[ATWS]") > -1){
-            had_gsm_data = true;
-            Serial1.print("5G,");
-            Serial1.print(count_5ghz);
-            Serial1.print("\n");
-            Serial.print("BW16 done, 5GHz count: ");
-            Serial.println(count_5ghz);
-            count_5ghz = 0;
-          }
-        }
-      }
+      partbuf = "";
+      partcount++;
+      if (c == '\n') partcount = 0;
     } else {
-      if (last_sim_request == 0 || millis() - last_sim_request > 15000 || had_gsm_data == true){
-        if (!using_bw16){
-          Serial2.print("AT+CNETSCAN\r\n");
-          Serial.println("Requesting data from SIM");
-        } else {
-          Serial2.print("ATWS\r\n");
-          Serial.println("Requesting data from BW16");
-        }
-        last_sim_request = millis();
-        had_gsm_data = false;
-      }
+      partbuf.concat(c);
     }
+    cur++;
   }
+  return update_available;
 }
 
+// ===== MAC history =====
 void save_mac(unsigned char* mac){
-  if (mac_history_cursor >= mac_history_len){
-    mac_history_cursor = 0;
-  }
+  if (mac_history_cursor >= mac_history_len) mac_history_cursor = 0;
   struct mac_addr tmp;
-  for (int x = 0; x < 6 ; x++){
-    tmp.bytes[x] = mac[x];
-  }
-
+  for (int x = 0; x < 6 ; x++) tmp.bytes[x] = mac[x];
   mac_history[mac_history_cursor] = tmp;
   mac_history_cursor++;
 }
 
-boolean seen_mac(unsigned char* mac){
-
-  struct mac_addr tmp;
-  for (int x = 0; x < 6 ; x++){
-    tmp.bytes[x] = mac[x];
-  }
-
-  for (int x = 0; x < mac_history_len; x++){
-    if (mac_cmp(tmp, mac_history[x])){
-      return true;
-    }
-  }
-  return false;
-}
-
-void print_mac(struct mac_addr mac){
-  for (int x = 0; x < 6 ; x++){
-    Serial.print(mac.bytes[x],HEX);
-    Serial.print(":");
-  }
-}
-
 boolean mac_cmp(struct mac_addr addr1, struct mac_addr addr2){
   for (int y = 0; y < 6 ; y++){
-    if (addr1.bytes[y] != addr2.bytes[y]){
-      return false;
-    }
+    if (addr1.bytes[y] != addr2.bytes[y]) return false;
   }
   return true;
 }
 
-void clear_mac_history(){
+boolean seen_mac(unsigned char* mac){
   struct mac_addr tmp;
-  for (int x = 0; x < 6 ; x++){
-    tmp.bytes[x] = 0;
-  }
-  
+  for (int x = 0; x < 6 ; x++) tmp.bytes[x] = mac[x];
   for (int x = 0; x < mac_history_len; x++){
-    mac_history[x] = tmp;
+    if (mac_cmp(tmp, mac_history[x])) return true;
+  }
+  return false;
+}
+
+boolean is_blocked(String test_str){
+  if (!use_blocklist) return false;
+  unsigned int test_str_len = test_str.length();
+  if (test_str_len == 0 || test_str_len > blocklist_str_len) return false;
+
+  for (byte i=0; i<blocklist_len; i++){
+    boolean matched = true;
+    for (byte ci=0; ci<test_str_len; ci++){
+      if (test_str.charAt(ci) != block_list[i].characters[ci]){
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return true;
+  }
+  return false;
+}
+
+// ===== GPS helpers =====
+String dt_string_from_gps(){
+  String datetime = "";
+  if (nmea.getYear() > 0){
+    datetime += nmea.getYear();
+    datetime += "-";
+    datetime += nmea.getMonth();
+    datetime += "-";
+    datetime += nmea.getDay();
+    datetime += " ";
+    datetime += nmea.getHour();
+    datetime += ":";
+    datetime += nmea.getMinute();
+    datetime += ":";
+    datetime += nmea.getSecond();
+  }
+  return datetime;
+}
+
+boolean set_sys_clock(unsigned long new_epoch){
+  struct timeval val;
+  val.tv_sec = new_epoch;
+  val.tv_usec = 0;
+  int ret = settimeofday(&val, NULL);
+  return (ret == 0);
+}
+
+void gps_time_sync(){
+  String gps_dt = dt_string_from_gps();
+  if (gps_dt.length() < 5) return;
+
+  struct tm tm;
+  unsigned long this_epoch = 0;
+  strptime(gps_dt.c_str(), "%Y-%m-%d %H:%M:%S", &tm );
+  this_epoch = (unsigned long)mktime(&tm);
+  if (this_epoch < YEAR_2020) return;
+  set_sys_clock(this_epoch);
+}
+
+String gps_string(){
+  String out = "";
+  long alt = 0;
+  if (!nmea.getAltitude(alt)) alt = 0;
+  float altf = (float)alt / 1000;
+
+  String lats = String((float)nmea.getLatitude()/1000000, 7);
+  String lons = String((float)nmea.getLongitude()/1000000, 7);
+  if (nmea.isValid() && nmea.getHDOP() <= 250){
+    last_lats = lats;
+    last_lons = lons;
   }
 
-  mac_history_cursor = 0;
+  if (nmea.getHDOP() > 250){
+    lats = "";
+    lons = "";
+  }
+
+  float accuracy = ((float)nmea.getHDOP()/10);
+  accuracy = accuracy * 2.5;
+
+  if (!nmea.isValid()){
+    lats = "";
+    lons = "";
+    accuracy = 1000;
+    if (lastgps + gps_allow_stale_time > millis()){
+      lats = last_lats;
+      lons = last_lons;
+      accuracy = 5 + (millis() - lastgps) / 100;
+    }
+  }
+
+  if (accuracy <= 2.5) accuracy = 2.5;
+
+  if (force_lat != 0 && force_lon != 0){
+    lats = String(force_lat, 6);
+    lons = String(force_lon, 6);
+    accuracy = 1;
+  }
+
+  out = lats + "," + lons + "," + altf + "," + accuracy;
+  return out;
+}
+
+// ===== Device strings =====
+String device_type_string(){
+  switch (DEVICE_TYPE){
+    case DEVICE_REV3: return "rev3";
+    case DEVICE_REV3_5: return "rev3 5GHz";
+    case DEVICE_REV3_5GM: return "rev3 5GHz (mod)";
+    case DEVICE_REV4: return "rev4";
+    case DEVICE_CSF_MINI: return "Mini Wardriver Rev2";
+    default: return "generic";
+  }
+}
+
+String device_brand_string(){
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI: return "CoD_Segfault";
+    default: return "JHewitt";
+  }
+}
+
+String device_string(){
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI: return "tim";
+    default: return "wardriver.uk " + device_type_string();
+  }
+}
+
+String device_board_string(){
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI: return "tim";
+    default: return "wardriver.uk " + device_type_string();
+  }
+}
+
+// ===== LCD =====
+void lcd_show_stats(){
+  boolean wifi_did_block = false;
+  if (millis() - wifi_block_at < 30000) wifi_did_block = true;
+
+  clear_display();
+  display.print("WiFi:");
+  display.print(disp_wifi_count);
+  if (wifi_did_block) display.print("X");
+
+  // Show 5GHz count
+  display.print("|");
+  display.print(count_5ghz);
+
+  if (int(temperature) != 0) {
+    display.print(" T:");
+    if (!tempunits_c) {
+      float temperatureF = (temperature * 9.0 / 5.0) + 32.0;
+      display.print(temperatureF);
+      display.print("f");
+    } else {
+      display.print(temperature);
+      display.print("c");
+    }
+  }
+  display.println();
+
+  if (nmea.getHDOP() < 250 && nmea.getNumSatellites() > 0){
+    display.print("HDOP:");
+    display.print(((float)nmea.getHDOP()/10));
+    display.print(" Sats:");
+    display.print(nmea.getNumSatellites());
+    display.println(nmea.getNavSystem());
+  } else {
+    display.print("No GPS");
+  }
+  display.println(dt_string(get_epoch()));
+  display.display();
+}
+
+// ===== WiFi security =====
+String security_int_to_string(int security_type){
+  String authtype = "";
+  switch (security_type){
+    case WIFI_AUTH_OPEN: authtype = "[OPEN]"; break;
+    case WIFI_AUTH_WEP: authtype = "[WEP]"; break;
+    case WIFI_AUTH_WPA_PSK: authtype = "[WPA_PSK]"; break;
+    case WIFI_AUTH_WPA2_PSK: authtype = "[WPA2_PSK]"; break;
+    case WIFI_AUTH_WPA_WPA2_PSK: authtype = "[WPA_WPA2_PSK]"; break;
+    case WIFI_AUTH_WPA2_ENTERPRISE: authtype = "[WPA2]"; break;
+    case WIFI_AUTH_WPA3_PSK: authtype = "[WPA3_PSK]"; break;
+    case WIFI_AUTH_WPA2_WPA3_PSK: authtype = "[WPA2_WPA3_PSK]"; break;
+    case WIFI_AUTH_WAPI_PSK: authtype = "[WAPI_PSK]"; break;
+    default: authtype = "[UNDEFINED]";
+  }
+  return authtype;
+}
+
+String get_latest_datetime(String filename, boolean date_only){
+  String buff = "";
+  File reader = SD.open(filename, FILE_READ);
+  if (!reader) return "";
+  time_t meta_lastwrite = reader.getLastWrite();
+  String dt = "";
+  if (meta_lastwrite > YEAR_2020){
+    dt = dt_string(meta_lastwrite);
+  } else {
+    int seekto = reader.size()-512;
+    if (seekto < 1) seekto = 0;
+    reader.seek(seekto);
+    int ccount = 0;
+    while (reader.available()){
+      char c = reader.read();
+      if (c == '\n' || c == '\r'){
+        if (ccount == 10){
+          int startpos = buff.indexOf("],2");
+          int endpos = buff.indexOf(",",startpos+3);
+          if (startpos > 0 && endpos > 0){
+            dt = buff.substring(startpos+2,endpos);
+            break;
+          }
+        }
+        ccount = 0;
+        buff = "";
+      } else {
+        buff.concat(c);
+        if (c == ',') ccount++;
+      }
+    }
+  }
+  reader.close();
+  if (date_only){
+    int spacepos = dt.indexOf(" ");
+    String new_dt = dt.substring(0,spacepos);
+    dt = new_dt;
+  }
+  return dt;
+}
+
+// ===== Boot config =====
+void boot_config(){
+  gps_baud_rate = get_config_int("gps_baud_rate", 9600);
+  rotate_display = get_config_bool("rotate_display", rotate_display);
+  block_resets = get_config_bool("block_resets", block_resets);
+  block_reconfigure = get_config_bool("block_reconfigure", block_reconfigure);
+  web_timeout = get_config_int("web_timeout", web_timeout);
+  gps_allow_stale_time = get_config_int("gps_allow_stale_time", gps_allow_stale_time);
+  enforce_valid_binary_checksums = get_config_bool("enforce_checksums", enforce_valid_binary_checksums);
+  nets_over_uart = get_config_bool("nets_over_uart", nets_over_uart);
+  ota_hostname = get_config_string("ota_hostname", ota_hostname);
+  auto_reset_ms = get_config_int("auto_reset_ms", auto_reset_ms);
+  force_lat = get_config_float("force_lat", force_lat);
+  force_lon = get_config_float("force_lon", force_lon);
+  scanble = get_config_bool("scanble", scanble);
+  tempunits_c = get_config_bool("tempunits_c", tempunits_c);
+  con_ssid_update = get_config_bool("con_ssid_update", con_ssid_update);
+
+  preferences.begin("wardriver", false);
+  ota_optout = preferences.getBool("ota_optout", false);
+  wigle_commercial = preferences.getBool("wigle_com", false);
+  wigle_autoupload = preferences.getBool("wigle_au", false);
+  wigle_api_key = preferences.getString("wigle_api_key", "");
+  bool firstrun = preferences.getBool("first", true);
+  if (block_reconfigure) firstrun = false;
+  bool doreset = preferences.getBool("reset", false);
+  if (block_resets) doreset = false;
+  bootcount = preferences.getULong("bootcount", 0);
+
+  if (doreset){
+    preferences.clear();
+    preferences.end();
+    ESP.restart();
+  }
+
+  if (!firstrun && !block_resets){
+    preferences.putBool("reset", true);
+    preferences.end();
+    clear_display();
+    display.println("Power cycle now");
+    display.println("to factory reset");
+    display.display();
+    delay(1250);
+    preferences.begin("wardriver", false);
+    preferences.putBool("reset", false);
+    clear_display();
+  }
+
+  if (firstrun){
+    preferences.putBool("reset", true);
+    preferences.end();
+    delay(100);
+    preferences.begin("wardriver", false);
+
+    setup_wifi();
+
+    int n = WiFi.scanNetworks(false,false);
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(default_ssid.c_str(), default_psk);
+    IPAddress IP = WiFi.softAPIP();
+    clear_display();
+    display.println("Connect to:");
+    display.println(default_ssid);
+    display.println(IP);
+    display.display();
+    delay(500);
+
+    WiFiServer server(80);
+    server.begin();
+    boolean newline = false;
+    String buff;
+
+    while (firstrun){
+      WiFiClient client = server.available();
+      while (client.connected()){
+        if (client.available()){
+          char c = client.read();
+          buff += c;
+          if (c == '\n'){
+            if (newline){
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-type: text/html");
+              client.println("Connection: close");
+              client.println();
+
+              if (buff.indexOf("GET / HTTP") > -1) {
+                client.print("<style>html{font-size:21px;text-align:center;padding:20px}input[type=text],input[type=password],input[type=submit],select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
+                client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1><h2>First time setup</h2>");
+                client.print("<p>Please provide the credentials of your WiFi network to get started.</p>");
+                if (n > 0){
+                  client.println("<script>function ssid_selected(obj){document.getElementById(\"ssid\").value = obj.value;}</script>");
+                  client.println("<select onchange=\"ssid_selected(this)\" name=\"ssid\" id=\"ssid_select\">");
+                  client.println("<option value=\"Select your network\">Select your network</option>");
+                  for (int i = 0; i < n; i++) {
+                    client.print("<option value=\"");
+                    client.print(WiFi.SSID(i));
+                    client.print("\">");
+                    client.print(WiFi.SSID(i));
+                    client.println("</option>");
+                  }
+                  client.println("</select>");
+                }
+                client.print("<form method=\"get\" action=\"/wifi\">WiFi Name (SSID):<input type=\"text\" name=\"ssid\" id=\"ssid\"><br>WiFi Password (PSK):<input type=\"password\" name=\"psk\" id=\"psk\"><br><br><input type=\"submit\" value=\"Submit\"><p><label for=\"otaoptout\"><input type=\"checkbox\" id=\"otaoptout\" name=\"otaoptout\" value=\"otaoptout\"> Disable OTA updates*</label></p></form>");
+                client.print("<a href=\"/wifi?ssid=&psk=\">Continue without network</a>");
+              }
+
+              if (buff.indexOf("GET /wifi?") > -1){
+                if (buff.indexOf("&otaoptout=otaoptout") > -1){
+                  ota_optout = true;
+                  buff.replace("&otaoptout=otaoptout","");
+                  preferences.putBool("ota_optout", true);
+                }
+                int startpos = buff.indexOf("?ssid=")+6;
+                int endpos = buff.indexOf("&");
+                String new_ssid = GP_urldecode(buff.substring(startpos,endpos));
+                startpos = buff.indexOf("&psk=")+5;
+                endpos = buff.indexOf(" HTTP");
+                String new_psk = GP_urldecode(buff.substring(startpos,endpos));
+
+                preferences.putString("ssid", new_ssid);
+                preferences.putString("psk", new_psk);
+
+                client.print("<h1>Thanks!</h1>Please wait. <meta http-equiv=\"refresh\" content=\"1; URL=/step2\" />");
+              }
+
+              if (buff.indexOf("GET /step2 HTTP") > -1){
+                client.print("<style>html{font-size:21px;text-align:center;padding:20px}input,select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
+                client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1><h2>Fallback network setup</h2>");
+                client.print("Please provide credentials for fallback network.<br>");
+                client.print("<form method=\"get\" action=\"/fbwifi\">SSID:<input type=\"text\" name=\"ssid\" id=\"ssid\"><br>PSK:<input type=\"password\" name=\"psk\" id=\"psk\"><br><input type=\"submit\" value=\"Submit\"></form>");
+                client.print("<a href=\"/fbwifi?ssid=&psk=\">Continue without fallback network</a>");
+              }
+
+              if (buff.indexOf("GET /fbwifi?") > -1){
+                int startpos = buff.indexOf("?ssid=")+6;
+                int endpos = buff.indexOf("&");
+                String new_ssid = GP_urldecode(buff.substring(startpos,endpos));
+                startpos = buff.indexOf("&psk=")+5;
+                endpos = buff.indexOf(" HTTP");
+                String new_psk = GP_urldecode(buff.substring(startpos,endpos));
+
+                preferences.putString("fbssid", new_ssid);
+                preferences.putString("fbpsk", new_psk);
+                client.print("<h1>Thanks!</h1>Your wardriver is now getting ready. <meta http-equiv=\"refresh\" content=\"1; URL=/done\" />");
+              }
+
+              if (buff.indexOf("GET /done HTTP") > -1){
+                client.print("<h1>Setup complete!</h1>Your wardriver will now boot normally.");
+                client.flush();
+                delay(800);
+                client.stop();
+                preferences.putBool("first", false);
+                firstrun = false;
+                break;
+              }
+
+              client.print("\n\r\n\r");
+              client.flush();
+              delay(5);
+              client.stop();
+              buff = "";
+            }
+            newline = true;
+          } else {
+            if (c != '\r') newline = false;
+          }
+        }
+      }
+    }
+
+    preferences.putBool("reset", false);
+    preferences.end();
+    delay(100);
+    preferences.begin("wardriver", false);
+  }
+
+  setup_wifi();
+
+  bootcount++;
+  preferences.putULong("bootcount", bootcount);
+
+  String con_ssid = preferences.getString("ssid","");
+  String con_psk = preferences.getString("psk","");
+  con_ssid = get_config_string("con_ssid", con_ssid);
+  con_psk = get_config_string("con_psk", con_psk);
+  String fb_ssid = preferences.getString("fbssid","");
+  String fb_psk = preferences.getString("fbpsk","");
+  fb_ssid = get_config_string("fb_ssid", fb_ssid);
+  fb_psk = get_config_string("fb_psk", fb_psk);
+  boolean created_network = false;
+
+  if (con_ssid_update) {
+    preferences.putString("ssid",con_ssid);
+    preferences.putString("psk",con_psk);
+  }
+
+  boolean is_stable = true;
+  if (VERSION.indexOf("b") > -1) is_stable = false;
+  if (VERSION.indexOf("r") > -1) is_stable = false;
+
+  if (con_ssid != "" || fb_ssid != ""){
+    clear_display();
+    display.print("Connecting to:");
+    display.print(con_ssid);
+    display.display();
+    if (con_ssid != ""){
+      WiFi.begin(con_ssid, con_psk);
+      int fcount = 0;
+      while (WiFi.status() != WL_CONNECTED) {
+        display.print(".");
+        display.display();
+        delay(150);
+        fcount++;
+        if (fcount > 75){
+          clear_display();
+          display.println("WiFi connect failed");
+          display.display();
+          delay(500);
+          if (fb_ssid != ""){
+            WiFi.mode(WIFI_AP);
+            WiFi.softAP(fb_ssid.c_str(), fb_psk.c_str());
+            created_network = true;
+            delay(500);
+          }
+          break;
+        }
+      }
+    } else {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(fb_ssid.c_str(), fb_psk.c_str());
+      created_network = true;
+      delay(500);
+    }
+
+    boolean update_available = false;
+    if (WiFi.status() == WL_CONNECTED || created_network == true){
+      if (!created_network){
+        configTime(0, 0, ntpServer);
+        ota_get_url("/wigle.crt", "/wigle.crt");
+        wigle_load_history();
+        if (wigle_autoupload) wigle_upload_all();
+        update_available = check_for_updates(is_stable, false);
+      }
+      unsigned long disconnectat = millis() + web_timeout;
+      String buff;
+      boolean newline = false;
+      WiFiServer server(80);
+      server.begin();
+      while (WiFi.status() == WL_CONNECTED || created_network == true){
+        clear_display();
+        if (created_network){
+          display.print("SSID:");
+          display.println(fb_ssid);
+          display.println(WiFi.softAPIP());
+        } else {
+          display.println(device_type_string());
+          display.println(WiFi.localIP());
+        }
+        display.print((disconnectat - millis())/1000);
+        display.println("s until boot");
+        if (update_available) display.println("Update available");
+        display.display();
+
+        if (millis() > disconnectat){
+          clear_display();
+          display.println("Disconnecting");
+          display.display();
+          setup_wifi();
+          delay(250);
+          break;
+        }
+
+        WiFiClient client = server.available();
+        if (client){
+          unsigned long client_last_byte_at = millis();
+          boolean first_byte = true;
+          while (client.connected()){
+            if (millis() - client_last_byte_at > 750){
+              client.stop();
+            }
+            if (client.available()){
+              client_last_byte_at = millis();
+              if (first_byte){
+                first_byte = false;
+              }
+              char c = client.read();
+              buff += c;
+              if (c == '\n'){
+                if (newline){
+                  client.println("HTTP/1.1 200 OK");
+                  client.println("Connection: close");
+
+                  disconnectat = millis() + web_timeout;
+
+                  if (buff.indexOf("GET / HTTP") > -1) {
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.println("<style>html,td,th{font-size:21px;text-align:center;padding:20px }table{padding:5px;width:100%;max-width:1000px;}td, th{border: 1px solid #999;padding: 0.5rem;}</style>");
+                    client.println("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1></head>");
+                    if (update_available && !SD.exists("/A.bin")){
+                      client.println("<p><a href=\"/dlupdate\">Software update available. Click here to download.</a></p>");
+                    }
+                    if (SD.exists("/A.bin")){
+                      client.println("<p>A software update is ready. <a href=\"/fwup\">click here to view</a></p>");
+                    }
+                    if (ota_optout){
+                      client.println("<p>OTA updates are turned off: <a href=\"/ota_change_pref\">Opt-in</a></p>");
+                    }
+                    client.print("<p><a href=\"/wigle-setup\">WiGLE Settings</a>");
+                    if (wigle_username.length() > 1){
+                      client.print(" (logged in as ");
+                      client.print(html_escape(wigle_username));
+                      client.print(")");
+                    } else if (wigle_api_key.length() > 2){
+                      client.print(" (login failed)");
+                    } else {
+                      client.print(" (not configured)");
+                    }
+                    client.println("</p>");
+
+                    client.println("<table><tr><th>File</th><th>Size</th><th>Status</th><th>Opt</th></tr>");
+                    File dir = SD.open("/");
+                    while (true) {
+                      File entry = dir.openNextFile();
+                      if (!entry) break;
+                      if (!entry.isDirectory()) {
+                        String filename = entry.name();
+                        if (filename.charAt(0) != '/'){ filename = "/"; filename.concat(entry.name()); }
+                        String filename_id = "";
+                        int first_pos = filename.indexOf("wd3-")+4;
+                        int second_pos = filename.indexOf(".", first_pos);
+                        filename_id = filename.substring(first_pos, second_pos);
+                        unsigned int filename_id_int = (int) filename_id.toInt();
+
+                        struct wigle_file wigle_file_reference = get_wigle_file(filename_id_int, entry.size());
+
+                        client.print("<tr><td>");
+                        client.print("<a href=\"/download?fn=");
+                        client.print(filename);
+                        client.print("\">");
+                        client.print(filename);
+                        String file_dt = get_latest_datetime(filename, false);
+                        client.print("</a>");
+                        if (file_dt.length() > 2){
+                          client.print(" from ");
+                          client.print(file_dt);
+                        }
+                        client.print("</td><td>");
+                        client.print(entry.size()/1024);
+                        client.print(" kb</td><td>");
+                        if (wigle_file_reference.fid == 0){
+                          client.print("Not uploaded");
+                        } else {
+                          client.print("Uploaded. ");
+                          if (wigle_file_reference.wait != true){
+                            client.print(wigle_file_reference.total_gps);
+                            client.print(" total WiFi (");
+                            client.print(wigle_file_reference.discovered_gps);
+                            client.print(" new)");
+                          } else {
+                            client.print("Not yet processed");
+                          }
+                        }
+                        client.print("</td><td>");
+                        if (filename.endsWith(".bin") || filename.endsWith(".csv")){
+                          client.print("<p><a href=\"/delete?fn=");
+                          client.print(filename);
+                          client.print("\">");
+                          client.print("Delete</a></p><p><a href=\"/upload?fn=");
+                          client.print(filename);
+                          client.print("\">Upload</a>");
+                        }
+                        client.println("</td></tr>");
+                      }
+                    }
+                    client.print("</table><br><hr>");
+                    if (!ota_optout){
+                      client.println("<p>No longer want OTA updates? <a href=\"/ota_change_pref\">Opt-out</a></p>");
+                    }
+                    client.print("<h2>Upload firmware</h2>");
+                    client.print("<input type=\"file\" id=\"file\" /><br><button id=\"read-file\">Read File</button>");
+                    client.print("<br><br>Currently installed: v");
+                    client.println(VERSION);
+                    client.println("<script>const ep=Math.round(Date.now()/1e3);var x=new XMLHttpRequest;x.open(\"GET\",\"time?v=\"+ep,!1),x.send(null); document.querySelector(\"#read-file\").addEventListener(\"click\",function(){if(\"\"==document.querySelector(\"#file\").value){alert(\"no file selected\");return}var e=document.querySelector(\"#file\").files[0],n=new FileReader;n.onload=function(n){let t=new XMLHttpRequest;var l=e.name;t.open(\"POST\",\"/fw?n=\"+l,!0),t.onload=e=>{window.location.href=\"/fwup\"};let r=new Blob([n.target.result],{type:\"application/octet-stream\"});t.send(r)},n.readAsArrayBuffer(e)});</script>");
+                  }
+
+                  if (buff.indexOf("GET /dlupdate") > -1){
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.print("<h1>Downloading updates. Check the wardriver LCD for progress</h1>");
+                    client.print("\n\r\n\r");
+                    client.flush();
+                    delay(5);
+                    client.stop();
+                    check_for_updates(is_stable, true);
+                  }
+
+                  if (buff.indexOf("GET /fwup") > -1){
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.println("<style>#hide{display:none}html,td,th{font-size:21px;text-align:center;padding:20px }table{padding:5px;width:100%;max-width:1000px;}td, th{border: 1px solid #999;padding: 0.5rem;}</style>");
+                    client.println("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk updater</h1></head>");
+                    client.println("<body><table><tr><th>Filename</th><th>SHA256</th><th>Opt</th></tr>");
+                    if (SD.exists("/A.bin")){
+                      String filehash = file_hash("/A.bin");
+                      String check_result = online_hash_check(filehash);
+                      String color = "red";
+                      String emoji = "&#9888;";
+                      if (check_result != ""){
+                        color = "green";
+                        emoji = "&#128274;";
+                      }
+                      client.println("<tr><td>A.bin</td><td><p style=\"color:" + color + "\">" + filehash + " " + emoji + "</p><p>" + check_result + "</p></td><td><a href=\"/fwins?h=" + filehash + "&n=/A.bin\">Install</a></td></tr>");
+                    }
+                    client.println("</tr></body>");
+                  }
+
+                  if (buff.indexOf("GET /fwins") > -1) {
+                    int startpos = buff.indexOf("?h=") + 3;
+                    int endpos = buff.indexOf("&");
+                    String expect_hash = GP_urldecode(buff.substring(startpos, endpos));
+                    startpos = buff.indexOf("&n=") + 3;
+                    endpos = buff.indexOf(" HTTP");
+                    String fw_filename = GP_urldecode(buff.substring(startpos, endpos));
+
+                    client.println("Content-type: text/html");
+                    client.println();
+                    if (expect_hash.length() > 0 && SD.exists(fw_filename)) {
+                      client.print("<h1>Firmware will now be installed. Check the wardriver LCD for progress</h1>");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      install_firmware(fw_filename, expect_hash);
+                    } else {
+                      client.print("<h1>Error verifying update</h1>");
+                    }
+                  }
+
+                  if (buff.indexOf("POST /fw") > -1){
+                    int startpos = buff.indexOf("?n=")+3;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String bin_filename = buff.substring(startpos,endpos);
+
+                    String newname = "/other.bin";
+                    if (bin_filename.startsWith("A")) newname = "/A.bin";
+
+                    if (SD.exists(newname)) SD.remove(newname);
+                    File binwriter = SD.open(newname, FILE_WRITE);
+
+                    clear_display();
+                    display.println("Firmware upload");
+                    display.display();
+
+                    unsigned long fw_last_byte = millis();
+                    unsigned long bytesin = 0;
+                    while (1) {
+                      if (client.available()){
+                        byte c = client.read();
+                        bytesin++;
+                        binwriter.write(c);
+                        fw_last_byte = millis();
+                        if (bytesin % 4096 == 0){
+                          clear_display();
+                          display.println("Firmware upload");
+                          display.print(bytesin / 1024);
+                          display.println("kb received");
+                          display.display();
+                        }
+                      }
+                      if (millis() - fw_last_byte > 4000){
+                        binwriter.flush();
+                        binwriter.close();
+                        break;
+                      }
+                    }
+                  }
+
+                  if (buff.indexOf("GET /time?") > -1){
+                    int startpos = buff.indexOf("?v=")+3;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String newtime_str = buff.substring(startpos,endpos);
+                    unsigned long newtime = atol(newtime_str.c_str());
+                    if (get_epoch() < YEAR_2020 && newtime > YEAR_2020){
+                      set_sys_clock(newtime);
+                    }
+                  }
+
+                  if (buff.indexOf("GET /upload?") > -1) {
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (SD.exists(filename)){
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<style>html,td,th{font-size:21px;text-align:center;padding:20px}</style><html>");
+                      client.print("<h1>Uploading");
+                      client.print(filename);
+                      client.print("</h1><h2>Check LCD for progress");
+                      client.print("</h2>Once complete, <a href=\"/\">click here</a> to continue.</html>");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      boolean success = wigle_upload(filename);
+                      if (success){
+                        clear_display();
+                        display.println("Uploaded OK");
+                        display.display();
+                        delay(1000);
+                        wigle_load_history();
+                      }
+                    }
+                  }
+
+                  if (buff.indexOf("GET /delete?") > -1) {
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (SD.exists(filename)){
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<style>html,td,th{font-size:21px;text-align:center;padding:20px}</style><html>");
+                      client.print("<h1>Confirm delete of ");
+                      client.print(filename);
+                      client.print("<br><a href=\"/\">Cancel</a></h1><br><h2><a href=\"/confirmdelete?fn=");
+                      client.print(filename);
+                      client.print("\">DELETE</a></h2></html>");
+                    }
+                  }
+
+                  if (buff.indexOf("GET /confirmdelete?") > -1) {
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (filename.endsWith(".csv") || filename.endsWith(".bin")){
+                      SD.remove(filename);
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<h1>Deleted ");
+                      client.print(filename);
+                      client.println("</h1>");
+                      client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                    }
+                  }
+
+                  if (buff.indexOf("GET /download?") > -1) {
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (!filename.endsWith(".csv") && filename != "/test.txt"){
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("Not allowed");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      buff = "";
+                      filename = "";
+                      break;
+                    }
+                    File reader = SD.open(filename, FILE_READ);
+                    if (reader){
+                      client.println("Content-type: text/csv");
+                      client.print("Content-Disposition: attachment; filename=\"");
+                      client.print(generate_filename(filename));
+                      client.println("\"");
+                      client.print("Content-Length: ");
+                      client.print(reader.size());
+                      client.println();
+                      client.println();
+                      client.flush();
+                      delay(2);
+                      client.write(reader);
+                      reader.close();
+                    }
+                  }
+
+                  if (client.connected()){
+                    client.print("\n\r\n\r");
+                    client.flush();
+                    delay(5);
+                    client.stop();
+                  }
+                  buff = "";
+                  disconnectat = millis() + web_timeout;
+                }
+                newline = true;
+              } else {
+                if (c != '\r') newline = false;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  preferences.end();
+}
+
+// ===== Wi-Fi scan =====
+void scan_wifi_once() {
+  disp_wifi_count = wifi_count;
+  wifi_count = 0;
+  count_5ghz = 0;
+
+  int n = WiFi.scanNetworks(false, true);
+  if (n < 0) {
+    delay(500);
+    return;
+  }
+
+  if (n > 0){
+    wifi_count += n;
+    for (int i = 0; i < n; i++) {
+      uint8_t *this_bssid_raw = WiFi.BSSID(i);
+      char this_bssid[18] = {0};
+      sprintf(this_bssid, "%02X:%02X:%02X:%02X:%02X:%02X",
+              this_bssid_raw[0], this_bssid_raw[1], this_bssid_raw[2],
+              this_bssid_raw[3], this_bssid_raw[4], this_bssid_raw[5]);
+
+      if (seen_mac(this_bssid_raw)) continue;
+      save_mac(this_bssid_raw);
+
+      total_new_wifi++;
+
+      String ssid = WiFi.SSID(i);
+      ssid.replace(",","_");
+
+      if (use_blocklist){
+        if (is_blocked(ssid)){
+          wifi_block_at = millis();
+          continue;
+        }
+        String tmp_mac_str = String(this_bssid);
+        tmp_mac_str.toUpperCase();
+        if (is_blocked(tmp_mac_str)){
+          wifi_block_at = millis();
+          continue;
+        }
+      }
+
+      int channel = WiFi.channel(i);
+      if (channel >= 36) count_5ghz++;
+
+      filewriter.printf("%s,%s,%s,%s,%d,%d,%s,WIFI\n",
+        this_bssid,
+        ssid.c_str(),
+        security_int_to_string(WiFi.encryptionType(i)).c_str(),
+        dt_string(get_epoch()).c_str(),
+        channel,
+        WiFi.RSSI(i),
+        gps_string().c_str()
+      );
+      if (nets_over_uart){
+        Serial.printf("NET=%s,%s,%s,%s,%d,%d,%s,WIFI\n",
+          this_bssid, ssid.c_str(),
+          security_int_to_string(WiFi.encryptionType(i)).c_str(),
+          dt_string(get_epoch()).c_str(),
+          channel, WiFi.RSSI(i), gps_string().c_str()
+        );
+      }
+    }
+  }
+  filewriter.flush();
+}
+
+// ===== Setup =====
+void setup() {
+  setup_wifi();
+  delay(500);
+
+  Serial.begin(115200);
+  ESP_LOGI(LOG_TAG_GENERIC, "Starting v%s, build %s", VERSION.c_str(), BUILD.c_str());
+
+  chip_id = (uint32_t)(random(0x7FFFFFFF));
+
+  default_ssid.concat(" - ");
+  default_ssid.concat(chip_id);
+  default_ssid.remove(default_ssid.length()-3);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    ESP_LOGE(LOG_TAG_GENERIC, "SSD1306 allocation failed");
+  }
+  display.setRotation(rotate_display ? 0 : 2);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.cp437(true);
+  display.println("Starting");
+  display.print("Version ");
+  display.println(VERSION);
+  display.display();
+  delay(1500);
+
+  if(!SD.begin(SD_CS, SPI, SPI_FREQ)){
+    ESP_LOGE(LOG_TAG_GENERIC, "SD Begin failed!");
+    clear_display();
+    display.println("SD Begin failed!");
+    display.display();
+    delay(4000);
+  } else {
+    sd_ready = true;
+    preferences.reload();
+  }
+
+  if (SD.cardType() == CARD_NONE){
+    clear_display();
+    display.println("No SD Card!");
+    display.display();
+    delay(10000);
+  }
+
+  ESP_LOGD(LOG_TAG_GENERIC, "Starting GPS serial at %i baud", gps_baud_rate);
+  Serial2.begin(gps_baud_rate, SERIAL_8N1, 16, 17);
+
+  for (int x = 0; x < 3000; x++){
+    int c_count = 0;
+    while (Serial2.available()){
+      c_count++;
+      if (c_count > 128) break;
+      char c = Serial2.read();
+      if (nmea.process(c)){
+        if (nmea.isValid()){
+          lastgps = millis();
+          gps_time_sync();
+        }
+      }
+    }
+    if (dt_string_from_gps() != "") break;
+    delay(1);
+  }
+  gps_time_sync();
+
+  filewriter = SD.open("/test.txt", FILE_APPEND);
+
+  boot_config();
+  setup_wifi();
+
+  display.setRotation(rotate_display ? 0 : 2);
+
+  if (SD.exists("/bl.txt")){
+    File blreader;
+    blreader = SD.open("/bl.txt", FILE_READ);
+    byte i = 0;
+    byte ci = 0;
+    while (blreader.available()){
+      char c = blreader.read();
+      if (c == '\n' || c == '\r'){
+        use_blocklist = true;
+        if (ci != 0) i += 1;
+        ci = 0;
+      } else {
+        block_list[i].characters[ci] = c;
+        ci += 1;
+        if (ci >= blocklist_str_len){
+          ci = 0;
+        }
+      }
+    }
+    blreader.close();
+  }
+
+  String filename = "";
+  while (filename == "" || SD.exists(filename)){
+    filename = "/wd3-";
+    filename = filename + bootcount;
+    filename = filename + ".csv";
+    if (SD.exists(filename)){
+      bootcount++;
+      filename = "";
+      preferences.begin("wardriver", false);
+      preferences.putULong("bootcount", bootcount);
+      preferences.end();
+    }
+  }
+
+  filewriter = SD.open(filename, FILE_APPEND);
+  filewriter.print("WigleWifi-1.4,appRelease=wardriver.uk " + VERSION + ",model=" + device_type_string() + ",release=wardriver.uk " + VERSION + ",device=" + device_string() + ",display=i2c LCD,board=" + device_board_string() + ",brand=" + device_brand_string() + "\n");
+  filewriter.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
+  filewriter.flush();
+
+  booted_at = millis();
+
+  clear_display();
+  display.println("Starting main..");
+  display.display();
+  started_at_millis = millis();
+}
+
+unsigned long millis_main(){
+  return millis()-booted_at;
+}
+
+void loop(){
+  // GPS ingest
+  while (Serial2.available()){
+    char c = Serial2.read();
+    if (nmea.process(c)){
+      if (nmea.isValid()){
+        lastgps = millis();
+      }
+    }
+  }
+
+  // WiFi scan
+  scan_wifi_once();
+
+  // LCD update
+  if (lcd_last_updated == 0 || millis() - lcd_last_updated > 1000){
+    gps_time_sync();
+    lcd_show_stats();
+    lcd_last_updated = millis();
+  }
+
+  if (auto_reset_ms != 0 && millis() > auto_reset_ms){
+    clear_display();
+    display.println("AUTO RESET");
+    display.println("Timer reached.");
+    display.display();
+    delay(1250);
+    ESP.restart();
+  }
 }
