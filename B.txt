@@ -1,9 +1,5 @@
-diff --git a/c:\Users\topsu\Documents\PlatformIO\Projects\WardriverV1\src/main.cpp b/c:\Users\topsu\Documents\PlatformIO\Projects\WardriverV1\src/main.cpp
-new file mode 100644
---- /dev/null
-+++ b/c:\Users\topsu\Documents\PlatformIO\Projects\WardriverV1\src/main.cpp
-@@ -0,0 +1,2116 @@
-+// Joseph Hewitt 2023
+
++//b Joseph Hewitt 2023
 +// BW16 "Side A" port - Dual-band Wi-Fi, no GSM, no Side-B for now.
 +
 +#include <Arduino.h>
